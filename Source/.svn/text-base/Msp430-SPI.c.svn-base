@@ -1,0 +1,772 @@
+/*****************************  (C) Quickfilter Technologies, Inc.  *************************//*!
+
+  @file  Msp430-SPI.c
+
+  Abstraction of MSP-430 SPI port for use with Quickfilter device drivers.
+
+  $Id: Msp430-SPI.c 125 2006-07-24 20:40:36Z jhopson $
+
+  *******************************************************************************************
+
+  @formats
+      - C
+      - Doxygen (comment markup to produce HTML docs)
+
+  @dependencies
+      - Operating System:  none
+      - Toolset:           IAR MSP
+      - Platform:          TI MSP-TS430PZ100  (any MSP430 should work)
+      - CPU Architecture:  MSP-430
+      - CPU Variant:       '449   (any MSP430 with the same USART should work)
+      - Device:            USART0
+      - CPU byte order:    little endian
+
+  @notes
+    -# This non-portable C file abstracts the SPI port of an MSP-430 for use by any SPI-
+       based Quickfilter devices.  This code doesn't have any context about the meaning
+       of the data it is sending or receiving over the SPI port.  It passes a raw payload
+       of bytes to or from the SPI port.  Interrupts are used, DMA is not.
+
+       @par
+       @verbatim
+         +-------------+------------------------------------------+
+         |             |             Application Code             |
+         |  Standard   +------------------------------------------+         This file
+         |      C      |   SPI-based Quickfilter Device Driver    |        -----------
+         |  Libraries  +------------------------------------------+ <--- provides this API
+         |             |  SPI Hardware Abstraction Library (HAL)  |
+         +-------------+------------------------------------------+
+       @endverbatim
+
+       @par
+       This library *only* manipulates SPI hardware and its interrupt control registers.
+       It doesn't call any other libraries.
+
+    -# SPI ports do not have to be opened or closed before use.  All ports are initialized
+       at startup with one call to @ref QfSpi_Init.
+
+    -# Low Power Mode 0 (LPM0) is used.  The CPU & MCLK are stopped, but the FLL+, SMCLK
+       and ACLK are fully active.  All enabled interrupts are acknwledged while in LPM0.
+
+    -# The Quickfilter software uses a device number to distinguish between multiple devices.
+       Only Device 0 (USART0) is implemented so far, but the interface can accommodate
+       adding more devices.
+
+    -# SPI ports only emit the clock when actually clocking data.
+
+    -# The SPI baud rate is a compile-time constant, SPI0_BAUD_DIVISOR, and so is not
+       adjustable at runtime.
+
+  @references
+     -# "MSP430x43x, MSP430x44x Mixed Signal Microcontroller (Rev. D) ", SLAS344D,
+            Version Aug. 2004, Texas Instruments, focus.ti.com/lit/ds/symlink/msp430f449.pdf
+     -# "TI MSP430x4xx Family User's Guide", SLAU056, Version E, Texas Instruments,
+            focus.ti.com/lit/ug/slau056e/slau056e.pdf
+     -# IAR Embedded Workbench Help, Version 3.40.2.3, www.iar.de
+     -# "doxygen", Version 1.4.6, Dimitri van Heesch, doxygen.org
+
+*///*********************************************************************************************
+
+
+#include  "Project.h"
+#include  "Platform.h"
+#include  "Msp430-SPI.h"                            //  Self include
+
+#include "spi.h"
+#include "vector_mapper.h"
+
+/************************************************************************************************
+    L o c a l   C o n s t a n t s ,   M a c r o s   a n d   T y p e s
+ ************************************************************************************************/
+
+///  Modulation control value for SPI0
+#define  SPI0_MODULATION_CONTROL   1
+
+
+///  Baud rate divisor value for SPI0
+#define  SPI0_BAUD_DIVISOR   0x8
+
+
+///  Current operation being performed by the SPI port.
+
+typedef enum {
+    Uninitialized, Idle, Write, BufferedRead, UnbufferedRead
+} SpiState;
+
+
+
+
+/************************************************************************************************
+    L o c a l   V a r i a b l e s
+ ************************************************************************************************/
+
+///  SPI0 port state
+static volatile SpiState Spi0State = Uninitialized;
+
+
+
+//****   S P I   0     W r i t e - R e l a t e d   D e f i n i t i o n s   ****
+
+///  Pointer to user buffer with data to send out SPI
+static volatile Byte * Spi0WriteBuffer;
+
+///  Index into user write buffer
+static volatile Count Spi0WriteBufferIndex;
+
+///  Total number of bytes to send from user buffer
+static volatile Count Spi0WriteBufferLength;
+
+
+
+//****   S P I   0     R e a d - R e l a t e d   D e f i n i t i o n s   ****
+
+
+///  Function pointer to be called in receive ISR when a byte is received
+static ReceiveCallback Spi0ReceiveCallback = 0;
+
+///  Buffer to which data will be placed for unbuffered reads
+static volatile Byte * Spi0ReadBuffer;
+
+///  Number of bytes in @ref Spi0ReadBuffer
+static volatile Count Spi0ReadDataCount;
+
+///  Number of bytes to read while in low power mode.  For an UnbufferedRead,
+///  is the total number of bytes.  For BufferedRead mode, this is the number
+///  of bytes in the read cycle, but buffering continues even after power mode
+///  has been exited.
+static volatile Count Spi0ReceivesUntilWakeup;
+
+
+///////////////////////////////////////////////////////
+// YEB
+///////////////////////////////////////////////////////
+#ifndef __YEB_IMMEDIATE__
+#include "switcher.h"
+
+#define REMEMBER_BUFFER_SIZE 16
+
+unsigned char rememberHandle;
+void rememberCallback(unsigned char tid, void* msg);
+void (*rememberFunc)(Byte* data, Byte leng) = 0;
+volatile Byte rememberPath[REMEMBER_BUFFER_SIZE];
+volatile Byte rememberLength = 0;
+volatile Byte rememberIndex = 0;
+#endif
+
+/************************************************************************************************
+    L o c a l   F u n c t i o n   P r o t o t y p e s
+ ************************************************************************************************/
+
+static Bool UnbufferedReadCallback(Byte NewByte);
+
+//__interrupt  
+static void Spi0ReadIsr(void);
+
+/******************************************************************************************
+ ******************************************************************************************
+ ********                                                                          ********
+ ********                   P u b l i c   F u n c t i o n s                        ********
+ ********                                                                          ********
+ ******************************************************************************************
+ ******************************************************************************************/
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Initialize the SPI devices before first use
+
+  @notes
+    -# Call this once before calling any other functions in this module, typically early
+       in system initialization.  Also call if the device needs to be re-initializd after
+       a call to QfSpi_DeInit().
+
+    -# The User's Guide gives the *required* initialization/re-configuration process for
+       the USART. "Failure to follow this process may result in unpredictable USART
+       behavior"
+          - Set SWRST
+          - Initialize all USART registers with SWRST=1 (including UxCTL)
+          - Enable USART module via the MEx SFRs (USPIEx)
+          - Clear SWRST via software
+          - Enable interrupts (optional) via the IEx SFRs (URXIEx and/or UTXIEx)
+
+*//*********************************************************************************************/
+
+void QfSpi_Init(void) {
+    /*
+//  Sanity check SPI0 state.
+Assert( Spi0State == Uninitialized );
+
+
+SetBit( UCTL0, SWRST );          //  Hold the USART in Reset while configuring
+
+ClearBit( IE1, URXIE0 );         //  Disable SPI0 Receive Interrupts
+
+U0ME  |= UTXE0 + URXE0;          //  Enable USART0 transmit and receive modules
+
+P3SEL |= 0x0E;                   //  Select the SPI option for USART0 pins (P3.1-3)
+
+UCTL0 |= CHAR +                  //  Character length is 8 bits
+         SYNC +                  //  Synchronous Mode (as opposed to UART)
+         MM;                     //  8-bit SPI Master **SWRST**
+
+UTCTL0 |= CKPH  +                //  UCLK delayed by 1/2 cycle
+          SSEL1 + SSEL0 +        //  Clock source is SMCLK (implies Master mode)
+                                 //         00 UCLKI               10 SMCLK
+                                 //         01 ACLK  (fastest)     11 SMCLK
+          STC;                   //  3-pin SPI mode (STE disabled)
+
+URCTL0 = 0;                      //  Receive control register
+
+UMCTL0 = SPI0_MODULATION_CONTROL;  //  No modulation
+UBR10  = GetHiByte( SPI0_BAUD_DIVISOR );   //  Set baud rate
+UBR00  = GetLoByte( SPI0_BAUD_DIVISOR );
+
+
+URCTL0 = 0;                      //  Init receiver contol register
+
+
+ME1  |= UTXE0 + URXE0;           //  Enable USART0 SPI transmit and receive.   (note that
+                                 //  URXE0 and USPIE0 are one in the same on the '449)
+
+ClearBit( UCTL0, SWRST );        //  Release USART state machine (begin operation).
+                                 //  Doesn't do anything in SPI mode until a write
+                                 //  to TXBUF0 occurs.
+     */
+    PIE1bits.SSPIE = 0;
+    IPR1bits.SSPIP = 0; //spi interrupt low priority
+
+    set_LIV_function(&Spi0ReadIsr);
+
+    TRISCbits.TRISC3 = 0; //sck output
+    TRISCbits.TRISC5 = 0; //sdo output
+    //TRISAbits.TRISA5 = 1;	//ss input
+
+    QfPlat_DeactivateQF4A512ChipSelect();
+    OpenSPI(SPI_FOSC_64, MODE_00, SMPEND);
+
+    Spi0State = Idle;
+
+    //YEB
+#ifndef __YEB_INTERRUPT__
+#ifndef __YEB_IMMEDIATE__
+    rememberHandle = registerTask(&rememberCallback, 0, (unsigned short) 0, -1);
+    pauseTask(rememberHandle);
+#endif
+#endif
+}
+
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Deinitialize the specified SPI device after last use.
+
+  @notes
+    -# Do not call any functions after calling this function, except QfSpi_Init().
+       It may be called later to re-initialize the SPI port.
+
+*//*********************************************************************************************/
+
+void QfSpi_DeInit(void) {
+    //Assert( Spi0State != Uninitialized );
+
+    //SetBit( UCTL0, SWRST );          //  Reset USART state machine
+
+    //  Be sure StreamRead is off.
+    QfSpi_Configure(0, SetUnbufferedReadMode, NULL, 0);
+
+    Spi0State = Uninitialized;
+}
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Write 'Length' bytes from 'Buffer' to SPI 0
+
+  @param[in]  Device  Device number. 0 for USART0.
+  @param[in]  Buffer  Buffer with input data
+  @param[in]  Length  Number of bytes to write
+
+  @notes
+    -# Transmits are interrupt-based, but not buffered.  This function returns only
+       after the 'Buffer' has been sent.  The CPU is put in Idle mode during the wait
+       to save power.
+
+    -# Data is transmitted byte-for-byte as it appears in the buffer.  Be sure the higher
+       level code handles any endian conversion before calling this function.
+
+    -# SPI data received during the write cycle is discarded.
+
+    -# SPI ports only emit the clock when actually transferring data.
+
+    -# The SPI interface timing for this call is as follows.   '^'=stable on
+       rising edge, all fields are msb first
+
+       @par
+       @verbatim
+                                     1 1 1 1 1 1 1 1 1 1 2 2 2 2
+                 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3
+          SCLK   ^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^...
+
+          SDO    [  Buffer[0]  ] [  Buffer[1]  ] [  Buffer[2]  ]...
+
+          SDI    x x x x x x x x x x x x x x x x x x x x x x x x...
+       @endverbatim
+
+*//*********************************************************************************************/
+
+void QfSpi_Write(
+        const Handle Device,
+        const Byte * Buffer,
+        const Count Length) {
+    //  Sanity check input parameters & mode.
+    //Assert( Device == SPI0_HANDLE);
+    //AssertNonNull( Buffer );
+    //Assert( Length > 0);
+    //Assert( Spi0State == Idle );
+
+
+    //  Setup info used in transmit interrupt handler
+    Spi0State = Write;
+    Spi0WriteBuffer = (volatile Byte *)Buffer;
+    Spi0WriteBufferIndex = 1;
+    Spi0WriteBufferLength = Length;
+
+    //  Enable SPI0 receive interrupts (clear flag before enabling)
+    //ClearBit( IFG1, URXIFG0 );
+    //SetBit( IE1, URXIE0 );
+    PIR1bits.SSPIF = 0;
+    PIE1bits.SSPIE = 1; //spi interrupt enable
+    if (SSPCON1bits.WCOL == 1) SSPCON1bits.WCOL = 0;
+
+    //  Send first byte to get engine started.  Write to TXBUF0 clears UTXIFG0.
+    SSPBUF = Buffer[ 0 ];
+
+    //  Idle in low power mode 0 while receiving.
+    //__low_power_mode_0();
+
+    //Spi0State = Idle;
+    while (Spi0State != Idle);
+}
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Read 'Length' bytes from the SPI port and return the data in 'Buffer'.
+
+  @param[in]  Device     Device number. 0 for USART0.
+  @param[out] Buffer     Buffer to hold read data
+  @param[in]  Length     Number of bytes to read.  Must be less than
+                         QF_SPI_SIZE_OF_SPI_READ_BUFFER - 3.
+
+  @return     True if buffer overflowed, false otherwise.
+
+  @notes
+    -# This function waits until Buffer is full to return.  The CPU is put in Idle
+       mode during the wait to save power.
+
+    -# Data appears in Buffer byte-for-byte as it arrives at the SPI port.  Be sure
+       higher level code handles any byte-order conversion of wide data.
+
+    -# As SPI master, MSP-430 controls the clock.
+
+    -# The SDO pin is always low (0) during a read cycle.
+
+    -# The SPI interface timing for this call is as follows.  '^'=stable on
+       rising edge, all fields are msb first
+
+          @verbatim
+                                     1 1 1 1 1 1 1 1 1 1 2 2 2 2
+                 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3
+          SCLK   ^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^-^...
+
+          SDO  xx_______________________________________________...
+
+          SDI    [  Buffer[0]  ] [  Buffer[1]  ] [  Buffer[2]  ]...
+          @endverbatim
+
+*//*********************************************************************************************/
+
+Result QfSpi_Read(
+        const Handle Device,
+        Byte * Buffer,
+        const Count Length) {
+
+    //  Check input parameters.
+    //Assert( Device == SPI0_HANDLE);
+    //AssertNonNull( Buffer );
+    //Assert( Length  >  0   &&
+    //        Length  <=  QF_SPI_SIZE_OF_SPI_READ_BUFFER);
+    //Assert( Spi0State == Idle );
+
+    //  UnbufferedRead mode requires some setup first.
+    Spi0State = UnbufferedRead;
+    Spi0ReceivesUntilWakeup = Length;
+    Spi0ReadBuffer = (volatile Byte *) Buffer;
+    Spi0ReadDataCount = 0;
+    Spi0ReceiveCallback = UnbufferedReadCallback;
+
+    //  Enable SPI0 receive interrupts (clear flag then enable)
+    //ClearBit( IFG1, URXIFG0 );
+    //SetBit( IE1, URXIE0 );
+    PIR1bits.SSPIF = 0;
+    PIE1bits.SSPIE = 1; //spi interrupt enable
+
+    QfSpi_ResumeReceive(Device);
+    while (Spi0State != Idle);
+    //  Use low power mode while waiting for
+    //  data transfer to complete.
+    //__low_power_mode_0();
+
+    //Spi0State = Idle;
+    return Success;
+}
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Configure aspects of SPI port operation.
+
+  @param[in]     Device   Device number. 0 for USART0.
+  @param[in]     Request  Type of configuration requested.
+  @param[in,out] Buffer   Any input or outout data associated with the configuration request.
+  @param[in,out] Length   Size of input or output data appropraite to the Request.
+
+  @return        True if configuration successful, otherwise false.
+
+*//*********************************************************************************************/
+
+Result QfSpi_Configure(
+        const Handle Device,
+        const QfSpi_ConfigRequest Request,
+        void * Buffer,
+        Count * Length) {
+    //  Check input parameters.
+    //Assert( Device == SPI0_HANDLE);
+    //Assert( Spi0State == Idle  ||  Spi0State == BufferedRead );
+    //Assert( Length == 0 );
+
+    //ClearBit( IE1, URXIE0 );        //  Disable SPI0 Receive Interrupts
+    PIE1bits.SSPIE = 0;
+
+    switch (Request) {
+#ifndef __YEB_IMMEDIATE__
+            //  Start reading and continuously buffering data
+        case SetBufferedReadMode:
+            Spi0State = BufferedRead;
+            Spi0ReceiveCallback = (ReceiveCallback) Buffer;
+            //  Enable SPI0 receive interrupts (clear flag then enable)
+            //ClearBit( IFG1, URXIFG0 );
+            PIR1bits.SSPIF = 0;
+            //SetBit( IE1, URXIE0 );
+            PIE1bits.SSPIE = 1; //spi interrupt enable
+            break;
+#endif
+            //  Set device to read bytes only as requested.  Note
+            //  that this is called to stop StreamRead mode.
+        case SetUnbufferedReadMode:
+            Spi0State = Idle;
+            break;
+
+            //  Crash if any other Request value is used during Debug
+#if defined(Debug)
+        default: Assert(0);
+#endif
+    }
+    return Success;
+}
+
+
+
+
+
+/******************************************************************************************
+ ******************************************************************************************
+ ********                                                                          ********
+ ********                  U t i l i t y   F u n c t i o n s                       ********
+ ********                                                                          ********
+ ******************************************************************************************
+ ******************************************************************************************/
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Read a single byte from the SPI port.
+
+  @param[in]   Device    Device handle
+
+  @return   The byte that was read from the SPI port.
+
+  @notes
+    -# This function doesn't handle any error conditions, including buffer overflow.  Only
+       use it in Unbuffered mode.
+
+*//*********************************************************************************************/
+
+inline
+Byte QfSpi_ReadByte(const Handle Device) {
+    Byte ReturnValue;
+
+    //Assert( Spi0State  !=  BufferedRead );
+
+    QfSpi_Read(Device, &ReturnValue, 1);
+
+    return ReturnValue;
+}
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Write a single byte 'Value' to the QF4A512 Configuration space at 'Address'.
+
+  @param[in]   Device    Device handle
+  @param[in]   Value     Byte to write to Configuration register
+
+*//*********************************************************************************************/
+
+inline
+void QfSpi_WriteByte(
+        const Handle Device,
+        const Byte Value) {
+
+    QfSpi_Write(Device, &Value, 1);
+}
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Write a two-byte 'Value' to the QF4A512 Configuration space at 'Address'.
+
+  @param[in]   Device    Device handle
+  @param[in]   Value     Byte to write to Configuration register
+
+*//*********************************************************************************************/
+
+inline
+void QfSpi_WriteUInt16(
+        const Handle Device,
+        UInt16 Value) {
+    //  Data is always sent most-significant byte first, so
+    //  change byte order to put MSB at low address.
+    Value = SwapUInt16Bytes(Value);
+
+    QfSpi_Write(Device, (Byte *) & Value, 2);
+}
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  Continue receiving SPI0 bytes.
+
+  @param[in]   Device    Device handle
+
+  -  This function only resumes an already-configured SPI port.  The SPI port must be
+     configured before calling this function.
+*//*********************************************************************************************/
+
+inline
+void QfSpi_ResumeReceive(const Handle Device) {
+    //  Check input parameters.
+    //Assert( Device == SPI0_HANDLE);
+
+    //  Receive clocking is started by loading the transmit register.
+    SSPBUF = 0;
+}
+
+
+
+
+/******************************************************************************************
+ ******************************************************************************************
+ ********                                                                          ********
+ ********            L o c a l   ( S t a t i c )   F u n c t i o n s               ********
+ ********                                                                          ********
+ ******************************************************************************************
+ ******************************************************************************************/
+
+
+
+/******************************************************************************************
+ ******************************************************************************************
+ ********                                                                          ********
+ ********            I n t e r r u p t   S e r v i c e   R o u t i n e s           ********
+ ********                                                                          ********
+ ******************************************************************************************
+ ******************************************************************************************/
+
+
+//  Suppress  "Warning[Pa082]: undefined behavior: the order of volatile accesses is
+//  undefined in this statement..." that occurs below.  The order is unimportant here.
+
+//#pragma  diag_suppress = Pa082
+
+
+
+
+/********************************************************************************************//*!
+
+  @summary  SPI0 receive interrupt service routine.
+
+  @notes
+    -  The Status Register (SR) is pushed on the stack on entry to the ISR, capturing the
+       Global Interrupt Enable (GIE) bit and the power management bits.  The SR is restored
+       from the stack when the Return from Interrupt (RETI) instruction executes at the end
+       of the ISR.
+
+       @par
+       The __low_power_mode_off_on_exit() call, used below, manipulates the copy of SR on
+       the stack.
+
+*//*********************************************************************************************/
+
+//#pragma  vector = USART0RX_VECTOR
+
+//__interrupt
+
+void Spi0ReadIsr(void) {
+    if (PIR1bits.SSPIF) {
+        PIR1bits.SSPIF = 0;
+        if (Spi0State == Write) {
+            //  Means of measuring frequency and length of write ISRs during Debug
+            //SetTestPoint( Spi0WriteIsrTestPoint );
+
+            //  Sanity checks
+            //AssertNonNull( Spi0WriteBuffer );
+            //Assert( Spi0WriteBufferIndex  <=  Spi0WriteBufferLength );
+            //Assert( Spi0State == Write );
+
+            //  If there's more data to send, load TXBUF0 to start another transmit.
+            if (Spi0WriteBufferIndex < Spi0WriteBufferLength) {
+                SSPBUF = Spi0WriteBuffer[ Spi0WriteBufferIndex++ ];
+            } else {
+                //  Disable transmit (technically 'receive') interrupts
+                //ClearBit( IE1, URXIE0 );
+                PIE1bits.SSPIE = 0; //spi interrupt disable
+
+                //  Defensive measure.  Null detected if ISR entered again.
+                Spi0WriteBuffer = 0;
+
+                //  Exit low power mode 0, and continue foreground operation
+                //  on return from this ISR
+                //__low_power_mode_off_on_exit();
+                Spi0State = Idle;
+            }
+            //ClearTestPoint( Spi0WriteIsrTestPoint );
+        }
+        else {
+            //  Means of measuring frequency and length of read ISRs during Debug
+            //SetTestPoint( Spi0ReadIsrTestPoint );
+
+            //  Sanity checks
+            //Assert( Spi0State == BufferedRead  ||  Spi0State == UnbufferedRead );
+            //Assert( Spi0ReadDataCount  <=  QF_SPI_SIZE_OF_SPI_READ_BUFFER );
+            //AssertNonNull( Spi0ReceiveCallback );
+
+            if ((*Spi0ReceiveCallback)(SSPBUF) == true) {
+                //  Start another cycle by loading the transmit register.
+                enable_daum();
+            } else {
+                //  Exit low power mode 0, and continue foreground operation on return from
+                //  this ISR.  (note that this does not turn off SPI reads in BufferedMode).
+                //__low_power_mode_off_on_exit();
+                disable_daum();
+                Spi0State = Idle;
+            }
+            //ClearTestPoint( Spi0ReadIsrTestPoint );
+        }
+    }
+}
+
+
+/********************************************************************************************//*!
+
+  @summary  Read ISR callback used for unbuffered reads.
+
+  -  This function is called during an interrupt service routine.  Be sure to keep
+     it as short as possible and only manipulate things that are appropriate to this context.
+
+*//*********************************************************************************************/
+
+Bool UnbufferedReadCallback(Byte NewByte) {
+    //  Store received byte in buffer
+    Spi0ReadBuffer[ Spi0ReadDataCount ] = NewByte;
+
+    //  Increase the count of bytes in Spi0ReadBuffer
+    Spi0ReadDataCount++;
+
+    //  If wakeup counter is active, decrease the count of bytes before
+    //  low-power mode is turned off.
+    if (--Spi0ReceivesUntilWakeup == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+
+///////////////////////////////////////////////////////
+// YEB
+///////////////////////////////////////////////////////
+
+#ifndef __YEB_INTERRUPT__
+#ifdef __YEB_IMMEDIATE__
+
+void getYebImmediate(Byte* data, Byte length) {
+    getsSPI(data, length);
+}
+
+#else
+
+Bool getYeb(Byte length, void (*fp)(Byte* data, Byte leng)) {
+    unsigned char TempVar;
+
+    if (rememberLength == 0) {
+        rememberFunc = fp;
+        rememberLength = length;
+        rememberIndex = 0;
+        TempVar = SSPBUF;
+        PIR1bits.SSPIF = 0; //Clear interrupt flag
+        resumeTask(rememberHandle);
+        SSPBUF = 0;
+        return true;
+    }
+    return false;
+}
+
+void rememberCallback(unsigned char tid, void* msg) {
+    unsigned char TempVar;
+
+    if (PIR1bits.SSPIF == 1) {
+        rememberPath[rememberIndex++] = SSPBUF;
+        if (rememberLength == rememberIndex) {
+            //stop timer
+            //execute callback
+            rememberFunc((Byte*) rememberPath, (Byte) rememberLength);
+            rememberLength = 0;
+            pauseTask(rememberHandle);
+        } else {
+            TempVar = SSPBUF;
+            PIR1bits.SSPIF = 0; //Clear interrupt flag
+            resumeTask(rememberHandle);
+            SSPBUF = 0;
+        }
+    }
+}
+#endif
+#endif
